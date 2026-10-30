@@ -75,21 +75,40 @@ function userMessage(body) {
 }
 
 async function callModel(messages, timeoutMs) {
+  const apiKey = process.env.LLM_API_KEY;
+  if (!apiKey) throw new Error('LLM_API_KEY is not configured');
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const timer = setTimeout(() => ctl.abort(), Math.max(1000, timeoutMs));
   try {
     const req = { model: MODEL, temperature: 0, messages };
     if (process.env.LLM_JSON_MODE !== '0') req.response_format = { type: 'json_object' };
-    const r = await fetch(`${BASE}/chat/completions`, {
-      method: 'POST', signal: ctl.signal, redirect: 'error',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.LLM_API_KEY || ''}` },
-      body: JSON.stringify(req),
-    });
-    if (!r.ok) throw new Error(`model http ${r.status}`);
-    const j = await r.json();
-    const text = j?.choices?.[0]?.message?.content ?? '';
-    const cleaned = String(text).replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim();
-    return JSON.parse(cleaned);
+    let response;
+    try {
+      response = await fetch(`${BASE}/chat/completions`, {
+        method: 'POST', signal: ctl.signal, redirect: 'error',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(req),
+      });
+    } catch (e) {
+      if (e?.name === 'AbortError') throw new Error('model request timed out');
+      throw new Error(`model network error: ${String(e?.message || e).slice(0, 160)}`);
+    }
+    const rawBody = await response.text();
+    let payload;
+    try { payload = rawBody ? JSON.parse(rawBody) : {}; }
+    catch { payload = { raw: rawBody.slice(0, 500) }; }
+    if (!response.ok) {
+      const detail = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
+      const err = new Error(`model http ${response.status}: ${String(detail).slice(0, 220)}`);
+      err.status = response.status;
+      err.retryable = response.status === 408 || response.status === 409 || response.status === 429 || response.status >= 500;
+      throw err;
+    }
+    const content = payload?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) throw new Error('model returned empty content');
+    const cleaned = content.replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+    try { return JSON.parse(cleaned); }
+    catch { throw new Error('model returned invalid JSON'); }
   } finally { clearTimeout(timer); }
 }
 
@@ -113,23 +132,33 @@ function mockPlan(body) {
   };
 }
 
-/** Returns { plan, modelStart, modelEnd } (ns timestamps supplied by caller via hooks). */
+/** One bounded planning operation. Retries transient provider failures and invalid model output. */
 export async function plan(body, { deadlineMs = 15000, now }) {
   const ids = evidenceIds(body.incident.transcript);
+  if (ids.size < 2) throw new Error('planner_input_invalid: transcript needs at least two evidence IDs');
   const started = Date.now();
   const modelStart = now();
   let lastErr = 'unknown';
   const messages = [{ role: 'system', content: SYSTEM }, { role: 'user', content: userMessage(body) }];
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const maxAttempts = MOCK ? 1 : 3;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const remaining = deadlineMs - (Date.now() - started);
-    if (remaining < 2500) break;
+    if (remaining < 1800) break;
     try {
-      const raw = MOCK ? mockPlan(body) : await callModel(messages, remaining - 500);
+      const raw = MOCK ? mockPlan(body) : await callModel(messages, remaining - 700);
       const p = validatePlan(raw, body, ids);
       return { plan: p, modelStart, modelEnd: now() };
     } catch (e) {
-      lastErr = String(e.message || e).slice(0, 200);
-      messages.push({ role: 'user', content: `Your previous answer was rejected: ${lastErr}. Return corrected JSON only.` });
+      lastErr = String(e?.message || e).slice(0, 300);
+      const retryable = e?.retryable === true || /invalid JSON|empty content|arguments invalid|evidence|rootCause|diagnostic|effect\.toolName/i.test(lastErr);
+      if (attempt + 1 >= maxAttempts || !retryable) break;
+      const delay = [400, 900][attempt] || 900;
+      const left = deadlineMs - (Date.now() - started);
+      if (left <= delay + 1800) break;
+      if (/invalid JSON|empty content|arguments invalid|evidence|rootCause|diagnostic|effect\.toolName/i.test(lastErr)) {
+        messages.push({ role: 'user', content: `Your previous JSON was invalid: ${lastErr}. Re-read the incident and tool catalog. Return corrected JSON only, with exact evidence IDs and schema-valid arguments.` });
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
   throw new Error('planner_failed: ' + lastErr);
