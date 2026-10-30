@@ -57,8 +57,11 @@ RULES:
    - Diagnostic tools must NOT be effect tools.
    - Arguments must satisfy the exact inputSchema.
    - Use exact service, deployment, version, region, time window
-     and feature-flag identifiers from the transcript.
-   - Do not invent identifiers.
+     and feature-flag identifiers from the incident/transcript.
+   - For a service argument, use incident.service exactly.
+   - For deployment/version/region/flag arguments, copy an identifier
+     that appears in the transcript. Never use placeholders such as
+     "value", "unknown", "latest", or invented identifiers.
    - Do not make duplicate calls.
 
 3. Effect:
@@ -98,6 +101,32 @@ export function evidenceIds(transcript) {
 
 function uniq(values) {
   return [...new Set(values)];
+}
+
+function validateGroundedArguments(args, body, toolName, phase) {
+  const transcript = body.incident.transcript || '';
+  const service = body.incident.service;
+  const deploymentTokens = new Set(
+    (transcript.match(/\b(?:v\d[\w.-]*|[A-Za-z0-9._-]*deploy[A-Za-z0-9._-]*)\b/gi) || [])
+      .map((x) => x.toLowerCase())
+  );
+  const transcriptLower = transcript.toLowerCase();
+  for (const [key, value] of Object.entries(args || {})) {
+    if (typeof value !== 'string') continue;
+    const k = key.toLowerCase();
+    if (/service/.test(k) && service && value !== service) {
+      return `${phase} ${toolName}: ${key} must match incident service`;
+    }
+    if (/deployment|version|release/.test(k)) {
+      if (!deploymentTokens.has(value.toLowerCase()) && !transcriptLower.includes(value.toLowerCase())) {
+        return `${phase} ${toolName}: ${key} is not grounded in transcript`;
+      }
+    }
+    if (/region|cluster|feature.?flag|flag/.test(k) && !transcriptLower.includes(value.toLowerCase())) {
+      return `${phase} ${toolName}: ${key} is not grounded in transcript`;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------
@@ -192,6 +221,9 @@ export function validatePlan(raw, body, ids) {
       );
     }
 
+    const groundingError = validateGroundedArguments(args, body, diagnostic.toolName, 'diagnostic');
+    if (groundingError) fail(groundingError);
+
     const key = diagnostic.toolName + canon(args);
 
     if (seen.has(key)) continue;
@@ -207,7 +239,7 @@ export function validatePlan(raw, body, ids) {
       : [];
 
     if (citations.length === 0) {
-      citations = [evidence[0]];
+      fail(`diagnostic ${diagnostic.toolName} must cite valid plan evidence`);
     }
 
     diagnostics.push({
@@ -256,6 +288,9 @@ export function validatePlan(raw, body, ids) {
     fail(`effect arguments invalid: ${effectSchemaError}`);
   }
 
+  const effectGroundingError = validateGroundedArguments(effectArguments, body, effect.toolName, 'effect');
+  if (effectGroundingError) fail(effectGroundingError);
+
   let effectEvidence = Array.isArray(effect.evidence)
     ? uniq(
         effect.evidence.filter(
@@ -265,7 +300,7 @@ export function validatePlan(raw, body, ids) {
     : [];
 
   if (effectEvidence.length === 0) {
-    effectEvidence = [evidence[0]];
+    fail('effect must cite valid plan evidence');
   }
 
   return {
@@ -516,76 +551,66 @@ async function callModel(messages, timeoutMs) {
 // ---------------------------------------------------------
 
 function mockPlan(body) {
-  const ids = [
-    ...evidenceIds(body.incident.transcript),
-  ];
+  const ids = [...evidenceIds(body.incident.transcript)];
+  if (ids.length < 2) throw new Error('mock planner requires two evidence IDs');
+  const transcript = body.incident.transcript;
+  const effectTools = new Set(body.policy.effectTools || []);
+  const catalog = body.toolCatalog || [];
+  const versionMatch = transcript.match(/\b(?:deploy(?:ment)?\s*)?(v\d[\w.-]*)\b/i);
+  const deploymentMatch = transcript.match(/\b(?:deployment|deploy)\s*(?:id|=|:)?\s*([A-Za-z0-9._-]+)\b/i);
+  const deployment = versionMatch?.[1] || deploymentMatch?.[1] || null;
 
-  if (ids.length < 2) {
-    throw new Error('mock planner requires two evidence IDs');
-  }
-
-  const effectTools = new Set(
-    body.policy.effectTools
-  );
-
-  function fill(schema) {
-    const result = {};
-
-    for (const required of schema?.required || []) {
-      const property =
-        schema.properties?.[required] || {};
-
-      if (property.enum?.length) {
-        result[required] = property.enum[0];
-      } else if (property.type === 'integer' ||
-                 property.type === 'number') {
-        result[required] = 1;
-      } else if (property.type === 'boolean') {
-        result[required] = true;
-      } else if (property.type === 'array') {
-        result[required] = [];
-      } else {
-        result[required] = 'value';
-      }
+  function buildArguments(tool) {
+    const schema = tool.inputSchema || {};
+    const props = schema.properties || {};
+    const args = {};
+    for (const key of schema.required || []) {
+      const spec = props[key] || {};
+      const lower = key.toLowerCase();
+      if (Array.isArray(spec.enum) && spec.enum.length) args[key] = spec.enum[0];
+      else if (/service/.test(lower) && body.incident.service) args[key] = body.incident.service;
+      else if (/deployment|version|release/.test(lower) && deployment) args[key] = deployment;
+      else if (/region/.test(lower)) {
+        const m = transcript.match(/\bregion\s*[:=]?\s*([A-Za-z0-9-]+)/i);
+        if (m) args[key] = m[1]; else throw new Error(`cannot ground ${key}`);
+      } else if (/flag/.test(lower)) {
+        const m = transcript.match(/\b(?:flag|feature)\s*[:=]?\s*([A-Za-z0-9._-]+)/i);
+        if (m) args[key] = m[1]; else throw new Error(`cannot ground ${key}`);
+      } else if (spec.type === 'integer' || spec.type === 'number') args[key] = spec.minimum ?? 1;
+      else if (spec.type === 'boolean') args[key] = false;
+      else if (spec.type === 'array') args[key] = [];
+      else if (spec.type === 'string') throw new Error(`cannot ground required argument ${key} for ${tool.name}`);
+      else throw new Error(`cannot construct required argument ${key} for ${tool.name}`);
     }
-
-    return result;
+    return args;
   }
 
-  const diagnosticTools = body.toolCatalog
-    .filter((tool) => !effectTools.has(tool.name))
-    .slice(0, 2);
+  const maximum = Math.max(1, Math.min(3, Number(body.policy.maximumDiagnostics) || 3));
+  const diagnostics = catalog.filter((tool) => !effectTools.has(tool.name)).slice(0, maximum);
+  const effectTool = catalog.find((tool) => tool.name === 'rollback_deployment' && effectTools.has(tool.name))
+    || catalog.find((tool) => effectTools.has(tool.name));
+  if (!diagnostics.length || !effectTool) throw new Error('mock planner requires diagnostic and effect tools');
 
-  const effectTool =
-    body.toolCatalog.find(
-      (tool) => tool.name === 'rollback_deployment' &&
-        effectTools.has(tool.name)
-    ) ||
-    body.toolCatalog.find(
-      (tool) => effectTools.has(tool.name)
-    );
-
-  if (!diagnosticTools.length || !effectTool) {
-    throw new Error(
-      'mock planner requires diagnostic and effect tools'
-    );
-  }
+  const deployEvidence = ids.find((id) => {
+    const line = transcript.split(/\r?\n/).find((x) => x.includes(`[${id}]`)) || '';
+    return /deploy|release|version/i.test(line);
+  }) || ids[0];
+  const otherEvidence = ids.find((id) => id !== deployEvidence) || ids[1];
+  const rootCause = /deploy|release|version/i.test(transcript) && body.incident.allowedRootCauses.includes('bad_deploy')
+    ? 'bad_deploy' : body.incident.allowedRootCauses[0];
 
   return {
-    rootCause: body.incident.allowedRootCauses[0],
-
-    evidence: ids.slice(0, 2),
-
-    diagnostics: diagnosticTools.map((tool) => ({
+    rootCause,
+    evidence: [deployEvidence, otherEvidence],
+    diagnostics: diagnostics.map((tool, i) => ({
       toolName: tool.name,
-      arguments: fill(tool.inputSchema),
-      evidence: [ids[0]],
+      arguments: buildArguments(tool),
+      evidence: [i === 0 ? otherEvidence : deployEvidence],
     })),
-
     effect: {
       toolName: effectTool.name,
-      arguments: fill(effectTool.inputSchema),
-      evidence: [ids[0]],
+      arguments: buildArguments(effectTool),
+      evidence: [deployEvidence],
     },
   };
 }

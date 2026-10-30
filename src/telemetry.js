@@ -36,7 +36,8 @@ export function buildOtlp(st) {
       const o = t.outcome;
       const cs = add(t.dispatchNs, 1000), ce = t.receiptNs;
       const attrs = [
-        attr('ga5.action.id', a.actionId), attr('gen_ai.tool.name', a.toolName), attr('ga5.attempt', t.attempt),
+        attr('ga5.action.id', a.actionId), attr('gen_ai.tool.name', a.toolName),
+        attr('gen_ai.tool.call.id', a.callId), attr('ga5.attempt', t.attempt),
         attr('ga5.receipt.id', o.receiptId), attr('ga5.receipt.nonce', o.nonce),
         attr('http.request.method', 'POST'), attr('http.request.resend_count', t.attempt - 1),
       ];
@@ -53,13 +54,16 @@ export function buildOtlp(st) {
     children.push(span(`execute_tool ${a.toolName}`, 1, a.execSpanId, st.ids.agent, a.startNs, eEnd, [
       attr('ga5.action.id', a.actionId), attr('gen_ai.tool.name', a.toolName), attr('gen_ai.tool.call.id', a.callId),
       attr('gen_ai.operation.name', 'execute_tool'), attr('ga5.phase', a.phase),
+      attr('ga5.attempt.count', atts.length),
+      ...(a.approvalId ? [attr('ga5.approval.id', a.approvalId)] : []),
+      ...(a.approvalNonce ? [attr('ga5.approval.nonce', a.approvalNonce)] : []),
     ]));
     children.push(...clients);
     maxEnd = max(maxEnd, eEnd);
   }
 
   const diagActs = st.actions.filter((a) => a.phase === 'diagnostic');
-  if (diagActs.length > 1) {
+  if (diagActs.length > 0) {
     let jStart = st.modelEnd;
     for (const a of diagActs) jStart = max(jStart, execEnd[a.callId]);
     jStart = add(jStart, 1000);
@@ -73,7 +77,14 @@ export function buildOtlp(st) {
   if (st.approval) {
     const ap = st.approval;
     const gEnd = add(ap.receivedNs || st.lastNs, 0);
-    const attrs = [attr('ga5.approval.id', ap.approvalId), attr('ga5.action.id', ap.actionId), attr('gen_ai.tool.name', ap.toolName)];
+    const effectDef = st.defs[st.effectCall];
+    const attrs = [
+      attr('ga5.approval.id', ap.approvalId),
+      attr('ga5.action.id', ap.actionId),
+      attr('gen_ai.tool.name', ap.toolName),
+      attr('gen_ai.tool.call.id', effectDef.callId),
+      attr('ga5.arguments.digest', ap.argumentsDigest),
+    ];
     if (ap.decision) {
       attrs.push(attr('ga5.approval.decision', ap.decision), attr('ga5.approval.nonce', ap.nonce),
         attr('ga5.approval.receipt.nonce', ap.nonce), attr('ga5.receipt.id', ap.receiptId), attr('ga5.receipt.nonce', ap.nonce));

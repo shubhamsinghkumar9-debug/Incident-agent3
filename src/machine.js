@@ -44,7 +44,11 @@ function issue(st, a, attempt, extra = {}) {
   const ns = nowNs();
   st.actionLog.push(d);
   (st.attempts[a.callId] ||= []).push({ attempt, actionId: a.actionId, spanId, dispatchNs: ns, idx: st.actionLog.length - 1, outcome: null });
-  if (attempt === 1) st.actions.push({ actionId: a.actionId, callId: a.callId, phase: a.phase, toolName: a.toolName, execSpanId: hex(8), startNs: ns });
+  if (attempt === 1) st.actions.push({
+    actionId: a.actionId, callId: a.callId, phase: a.phase,
+    toolName: a.toolName, execSpanId: hex(8), startNs: ns,
+    ...extra,
+  });
   st.lastNs = ns;
   return d;
 }
@@ -103,17 +107,21 @@ export function applyReceipt(st, body) {
   for (const o of outcomes) {
     if (!o || typeof o !== 'object') bad();
     const { actionId, callId, attempt, status, nonce } = o;
-    if (typeof actionId !== 'string' || typeof callId !== 'string' || !Number.isInteger(attempt) ||
-        !Number.isInteger(status) || typeof nonce !== 'string' || !nonce) bad();
+    if (typeof actionId !== 'string' || !actionId || typeof callId !== 'string' || !callId ||
+        !Number.isInteger(attempt) || attempt < 1 ||
+        !Number.isInteger(status) || typeof nonce !== 'string' || nonce.length < 8 || nonce.length > 256) bad();
     const cur = st.attempts[callId] && last(st, callId);
     if (!cur || cur.outcome || cur.actionId !== actionId || cur.attempt !== attempt || seen.has(callId)) bad();
     if (status === 0 ? o.errorType !== 'timeout' : status < 100 || status > 599) bad();
+    if (o.resultClass !== undefined && (typeof o.resultClass !== 'string' || o.resultClass.length > 128)) bad();
+    if (o.errorType !== undefined && (typeof o.errorType !== 'string' || o.errorType.length > 128)) bad();
     seen.add(callId);
     work.push({ o, cur });
   }
   for (const a of approvals) {
     if (!a || typeof a !== 'object' || !st.approval || st.approval.decision || a.approvalId !== st.approval.approvalId ||
-        !['approved', 'denied', 'rejected'].includes(a.decision) || typeof a.nonce !== 'string' || !a.nonce) bad();
+        !['approved', 'denied', 'rejected'].includes(a.decision) ||
+        typeof a.nonce !== 'string' || a.nonce.length < 8 || a.nonce.length > 256) bad();
   }
   // ---- apply (validated, so no partial failure) ----
   const rid = body.receiptId;
